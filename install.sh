@@ -23,5 +23,12 @@ case ":$PATH:" in
     ;;
 esac
 
+if ! command -v duti >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/duti ] && [ ! -x /usr/local/bin/duti ]; then
+  echo "Optional but recommended for named Desktop browser login:"
+  echo "  brew install duti"
+  echo
+fi
+
 echo "Run: clp doctor"
 echo "Then: clp add work"
+echo "First Desktop login: clp desktop-login work"

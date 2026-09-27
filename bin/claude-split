@@ -6,36 +6,44 @@ APP_BUNDLE="${CLAUDE_SPLIT_APP_BUNDLE:-/Applications/Claude.app}"
 DATA_ROOT="${CLAUDE_SPLIT_HOME:-$HOME/.local/share/claude-split}"
 PROFILE_ROOT="$DATA_ROOT/profiles"
 DESKTOP_ROOT="$HOME/Library/Application Support/Claude-Split"
+HANDLER_ROOT="$HOME/Applications/Claude Split"
 ACTIVE_FILE="$DATA_ROOT/active-profile"
+PENDING_FILE="$DATA_ROOT/pending-desktop-auth"
 LOG_ROOT="$DATA_ROOT/logs"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
-mkdir -p "$PROFILE_ROOT" "$DESKTOP_ROOT" "$LOG_ROOT"
+mkdir -p "$PROFILE_ROOT" "$DESKTOP_ROOT" "$HANDLER_ROOT" "$LOG_ROOT"
 
 usage() {
   cat <<'USAGE'
 claude-split — multiple Claude accounts on one Mac
 
 Usage:
-  clp add <profile>                   Create an isolated profile
-  clp list                            List profiles
-  clp use <profile>                   Save the active profile
-  clp current                         Show the active profile
+  clp add <profile>                       Create an isolated profile
+  clp list                                List profiles
+  clp use <profile>                       Save the active profile
+  clp current                             Show the active profile
 
-  clp auth [profile]                  Show Claude Code auth for that profile
-  clp login [profile]                 Log that profile into Claude Code
-  clp logout [profile]                Log that profile out of Claude Code
+  clp auth [profile]                      Show Claude Code auth for that profile
+  clp login [profile]                     Log that profile into Claude Code
+  clp logout [profile]                    Log that profile out of Claude Code
 
-  clp code [profile] [-- args...]     Launch Claude Code for a profile
-  clp desktop [profile]               Launch Claude Desktop for a profile
-  clp both [profile] [-- args...]     Launch Desktop, then Claude Code
+  clp code [profile] [-- args...]         Launch Claude Code for a profile
+  clp desktop [profile]                   Launch Claude Desktop for a profile
+  clp desktop-login [profile]             Launch Desktop and route browser OAuth back to it
+  clp both [profile] [-- args...]         Launch Desktop, then Claude Code
+  clp callback <profile> <claude://URL>   Manually route a Claude deep link to a profile
 
-  clp doctor                          Check installation and conflicting env vars
-  clp path <profile>                  Show profile storage paths
-  clp purge <profile>                 Permanently delete profile data
-  clp help                            Show this help
+  clp handler                             Show the current claude:// handler
+  clp handler reset                       Restore claude:// to the stock Claude app
+  clp doctor                              Check installation and conflicting env vars
+  clp path <profile>                      Show profile storage paths
+  clp purge <profile>                     Permanently delete profile data
+  clp help                                Show this help
 
 The special profile "default" uses your existing Claude login and files.
-Named profiles isolate both Desktop state and Claude Code auth/config.
+Named profiles isolate Desktop state and Claude Code auth/config.
+Use `clp desktop-login NAME` for the first Desktop sign-in or any browser-based re-login.
 USAGE
 }
 
@@ -51,31 +59,20 @@ valid_profile() {
   esac
 }
 
-profile_dir() {
-  printf '%s/%s/code\n' "$PROFILE_ROOT" "$1"
-}
+profile_dir() { printf '%s/%s/code\n' "$PROFILE_ROOT" "$1"; }
+desktop_dir() { printf '%s/%s\n' "$DESKTOP_ROOT" "$1"; }
+handler_app() { printf '%s/Claude Split - %s.app\n' "$HANDLER_ROOT" "$1"; }
+handler_log() { printf '%s/desktop-%s.log\n' "$LOG_ROOT" "$1"; }
 
-desktop_dir() {
-  printf '%s/%s\n' "$DESKTOP_ROOT" "$1"
-}
-
-profile_exists() {
-  [ "$1" = "default" ] || [ -d "$PROFILE_ROOT/$1" ]
-}
+profile_exists() { [ "$1" = "default" ] || [ -d "$PROFILE_ROOT/$1" ]; }
 
 active_profile() {
-  if [ -f "$ACTIVE_FILE" ]; then
-    cat "$ACTIVE_FILE"
-  else
-    printf 'default\n'
-  fi
+  if [ -f "$ACTIVE_FILE" ]; then cat "$ACTIVE_FILE"; else printf 'default\n'; fi
 }
 
 resolve_profile() {
   local requested="${1:-}"
-  if [ -z "$requested" ]; then
-    requested="$(active_profile)"
-  fi
+  [ -n "$requested" ] || requested="$(active_profile)"
   valid_profile "$requested" || die "invalid profile name: $requested"
   profile_exists "$requested" || die "profile '$requested' does not exist; run: clp add $requested"
   printf '%s\n' "$requested"
@@ -92,10 +89,46 @@ find_claude_cli() {
   printf '%s\n' "$candidate"
 }
 
-# Run a command with stale Claude/provider/proxy overrides removed. This is
-# deliberate: profile identity must come from the selected Claude profile, not
-# from ANTHROPIC_API_KEY/AUTH_TOKEN, an old local gateway, Vertex, or a stale
-# HTTP proxy exported for another development tool.
+plist_read() {
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
+}
+
+stock_bundle_id() {
+  [ -f "$APP_BUNDLE/Contents/Info.plist" ] || die "Claude Desktop not found at $APP_BUNDLE"
+  local id
+  id="$(plist_read "$APP_BUNDLE/Contents/Info.plist" CFBundleIdentifier)"
+  [ -n "$id" ] || die "could not read Claude Desktop CFBundleIdentifier"
+  printf '%s\n' "$id"
+}
+
+stock_executable() {
+  [ -f "$APP_BUNDLE/Contents/Info.plist" ] || die "Claude Desktop not found at $APP_BUNDLE"
+  local exe
+  exe="$(plist_read "$APP_BUNDLE/Contents/Info.plist" CFBundleExecutable)"
+  [ -n "$exe" ] || die "could not read Claude Desktop CFBundleExecutable"
+  printf '%s/Contents/MacOS/%s\n' "$APP_BUNDLE" "$exe"
+}
+
+find_duti() {
+  local p
+  for p in "$(command -v duti 2>/dev/null || true)" /opt/homebrew/bin/duti /usr/local/bin/duti; do
+    [ -n "$p" ] && [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+require_duti() {
+  local d
+  d="$(find_duti || true)"
+  if [ -z "$d" ]; then
+    die "browser OAuth routing needs duti. Install once with: brew install duti"
+  fi
+  printf '%s\n' "$d"
+}
+
+# Run a command with stale provider/proxy overrides removed. Profile identity
+# must come from the selected Claude profile, not an exported API key, local
+# gateway, Vertex config, old proxy, or NODE_OPTIONS.
 clean_env() {
   /usr/bin/env \
     -u ANTHROPIC_API_KEY \
@@ -113,9 +146,7 @@ clean_env() {
 }
 
 run_profile_cli() {
-  local profile="$1"
-  shift
-
+  local profile="$1"; shift
   local bin
   bin="$(find_claude_cli)"
 
@@ -127,11 +158,105 @@ run_profile_cli() {
   local cfg
   cfg="$(profile_dir "$profile")"
   mkdir -p "$cfg"
-
   clean_env \
     CLAUDE_CONFIG_DIR="$cfg" \
     CLAUDE_SECURESTORAGE_CONFIG_DIR="$cfg" \
     "$bin" "$@"
+}
+
+safe_bundle_suffix() {
+  printf '%s' "$1" | tr '[:upper:]_' '[:lower:]-' | sed 's/[^a-z0-9.-]/-/g'
+}
+
+handler_bundle_id() {
+  printf 'io.github.claude-split-macos.profile.%s\n' "$(safe_bundle_suffix "$1")"
+}
+
+self_command() {
+  # Prefer the command path the user actually invoked; this remains valid after
+  # install because clp is a symlink to claude-split.
+  local c
+  c="$(command -v clp 2>/dev/null || true)"
+  [ -n "$c" ] || c="$0"
+  printf '%s\n' "$c"
+}
+
+ensure_handler_app() {
+  local profile="$1"
+  [ "$profile" != "default" ] || return 0
+  [ -d "$APP_BUNDLE" ] || die "Claude Desktop not found at $APP_BUNDLE"
+  command -v osacompile >/dev/null 2>&1 || die "osacompile is required on macOS"
+
+  local app bid script_src clp_cmd
+  app="$(handler_app "$profile")"
+  bid="$(handler_bundle_id "$profile")"
+  clp_cmd="$(self_command)"
+
+  # Rebuild the tiny router app. It contains no Claude data or credentials.
+  rm -rf "$app"
+  mkdir -p "$HANDLER_ROOT"
+  script_src="$(mktemp -t claude-split-handler.XXXXXX.applescript)"
+
+  cat > "$script_src" <<APPLESCRIPT
+on run
+  do shell script quoted form of "$clp_cmd" & " _desktop-run " & quoted form of "$profile"
+end run
+
+on open location theURL
+  do shell script quoted form of "$clp_cmd" & " _desktop-callback " & quoted form of "$profile" & " " & quoted form of theURL
+end open location
+APPLESCRIPT
+
+  osacompile -o "$app" "$script_src" >/dev/null
+  rm -f "$script_src"
+
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bid" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName Claude Split - $profile" "$app/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Claude Split - $profile" "$app/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$app/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$app/Contents/Info.plist" 2>/dev/null || true
+
+  # Register the claude:// scheme on this small routing app.
+  /usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes" "$app/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string $bid" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string claude" "$app/Contents/Info.plist"
+
+  /usr/bin/codesign --force --sign - "$app" >/dev/null 2>&1 || true
+  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$app" >/dev/null 2>&1 || true
+}
+
+restore_stock_handler() {
+  local duti stock
+  duti="$(find_duti || true)"
+  [ -n "$duti" ] || return 1
+  stock="$(stock_bundle_id)"
+  "$duti" -s "$stock" claude all >/dev/null
+  rm -f "$PENDING_FILE"
+}
+
+launch_profile_desktop_process() {
+  local profile="$1"; shift
+  [ "$profile" != "default" ] || die "internal: named desktop launcher called for default"
+
+  local data cfg log exe
+  data="$(desktop_dir "$profile")"
+  cfg="$(profile_dir "$profile")"
+  log="$(handler_log "$profile")"
+  exe="$(stock_executable)"
+  mkdir -p "$data" "$cfg"
+
+  # Launch the real signed Claude binary directly. This is intentional: every
+  # invocation uses the profile's exact Electron user-data dir and Code auth
+  # dir, including invocations triggered by claude:// OAuth callbacks.
+  clean_env \
+    CLAUDE_USER_DATA_DIR="$data" \
+    CLAUDE_CONFIG_DIR="$cfg" \
+    CLAUDE_SECURESTORAGE_CONFIG_DIR="$cfg" \
+    "$exe" "--user-data-dir=$data" "$@" >>"$log" 2>&1 &
+  disown 2>/dev/null || true
 }
 
 cmd_add() {
@@ -142,20 +267,19 @@ cmd_add() {
   [ ! -d "$PROFILE_ROOT/$name" ] || die "profile '$name' already exists"
 
   mkdir -p "$(profile_dir "$name")" "$(desktop_dir "$name")"
+  ensure_handler_app "$name"
   printf 'created profile: %s\n\n' "$name"
-  printf '1. Login CLI identity:   clp login %s\n' "$name"
-  printf '2. Verify identity:      clp auth %s\n' "$name"
-  printf '3. Open Desktop:         clp desktop %s\n' "$name"
-  printf '4. Open CLI:             clp code %s\n' "$name"
+  printf '1. Login CLI identity:       clp login %s\n' "$name"
+  printf '2. Verify CLI identity:      clp auth %s\n' "$name"
+  printf '3. Login Desktop correctly:  clp desktop-login %s\n' "$name"
+  printf '4. Normal later launches:    clp desktop %s / clp code %s\n' "$name" "$name"
 }
 
 cmd_list() {
-  local active
+  local active dir name
   active="$(active_profile)"
   if [ "$active" = "default" ]; then printf '* '; else printf '  '; fi
   printf 'default\n'
-
-  local dir name
   for dir in "$PROFILE_ROOT"/*; do
     [ -d "$dir" ] || continue
     name="$(basename "$dir")"
@@ -171,17 +295,13 @@ cmd_use() {
   printf 'active profile: %s\n' "$name"
 }
 
-cmd_current() {
-  printf '%s\n' "$(active_profile)"
-}
+cmd_current() { printf '%s\n' "$(active_profile)"; }
 
 cmd_auth() {
   local profile
   profile="$(resolve_profile "${1:-}")"
   printf 'Profile: %s\n' "$profile"
-  if [ "$profile" != "default" ]; then
-    printf 'Config:  %s\n' "$(profile_dir "$profile")"
-  fi
+  [ "$profile" = "default" ] || printf 'Config:  %s\n' "$(profile_dir "$profile")"
   printf '\n'
   run_profile_cli "$profile" auth status --text || true
 }
@@ -202,108 +322,136 @@ cmd_logout() {
 }
 
 cmd_code() {
-  local maybe_profile="${1:-}"
-  local profile
-
+  local maybe_profile="${1:-}" profile
   if [ -n "$maybe_profile" ] && [ "$maybe_profile" != "--" ] && profile_exists "$maybe_profile"; then
-    profile="$maybe_profile"
-    shift
+    profile="$maybe_profile"; shift
   else
     profile="$(active_profile)"
   fi
-
-  if [ "${1:-}" = "--" ]; then shift; fi
+  [ "${1:-}" != "--" ] || shift
   profile="$(resolve_profile "$profile")"
 
   printf 'Claude Code profile: %s\n' "$profile" >&2
-  if [ "$profile" != "default" ]; then
-    printf 'Claude config:       %s\n' "$(profile_dir "$profile")" >&2
-  fi
+  [ "$profile" = "default" ] || printf 'Claude config:       %s\n' "$(profile_dir "$profile")" >&2
   printf '\n' >&2
-
   run_profile_cli "$profile" "$@"
 }
 
 launch_desktop_default() {
   [ -d "$APP_BUNDLE" ] || die "Claude Desktop not found at $APP_BUNDLE"
-
-  # Use LaunchServices for the stock instance, but strip the exact environment
-  # variables that previously caused CLI/Desktop auth and proxy confusion.
   clean_env /usr/bin/open -a "$APP_BUNDLE"
   printf 'opened Claude Desktop profile: default\n'
-  printf 'Desktop account: normal existing Claude Desktop login\n'
-  printf 'Code account:    normal existing Claude Code login\n'
 }
 
 launch_desktop_named() {
-  local profile="$1"
-  [ -d "$APP_BUNDLE" ] || die "Claude Desktop not found at $APP_BUNDLE"
-
-  local data cfg log
-  data="$(desktop_dir "$profile")"
-  cfg="$(profile_dir "$profile")"
-  log="$LOG_ROOT/desktop-$profile.log"
-  mkdir -p "$data" "$cfg"
+  local profile="$1" app
+  ensure_handler_app "$profile"
+  app="$(handler_app "$profile")"
 
   printf 'Launching Claude Desktop profile: %s\n' "$profile"
-  printf 'Desktop data: %s\n' "$data"
-  printf 'Code config:  %s\n' "$cfg"
+  printf 'Desktop data: %s\n' "$(desktop_dir "$profile")"
+  printf 'Code config:  %s\n' "$(profile_dir "$profile")"
   printf '\n'
-
-  # IMPORTANT:
-  # --user-data-dir / CLAUDE_USER_DATA_DIR isolate Desktop chat cookies/login.
-  # CLAUDE_CONFIG_DIR + secure-storage dir make the Desktop Code tab inherit the
-  # SAME Claude Code account as `clp code <profile>`.
-  # `open -n` asks LaunchServices for a separate application instance, while
-  # --env injects the profile environment into that specific instance.
-  # The surrounding clean_env prevents old shell API keys/proxies from winning.
-  if [ "$(uname -m)" = "arm64" ]; then
-    clean_env /usr/bin/open -n --arch arm64 -a "$APP_BUNDLE" \
-      --env "CLAUDE_USER_DATA_DIR=$data" \
-      --env "CLAUDE_CONFIG_DIR=$cfg" \
-      --env "CLAUDE_SECURESTORAGE_CONFIG_DIR=$cfg" \
-      --stderr "$log" \
-      --stdout "$log" \
-      --args "--user-data-dir=$data"
-  else
-    clean_env /usr/bin/open -n -a "$APP_BUNDLE" \
-      --env "CLAUDE_USER_DATA_DIR=$data" \
-      --env "CLAUDE_CONFIG_DIR=$cfg" \
-      --env "CLAUDE_SECURESTORAGE_CONFIG_DIR=$cfg" \
-      --stderr "$log" \
-      --stdout "$log" \
-      --args "--user-data-dir=$data"
-  fi
-
-  printf 'launched profile: %s\n' "$profile"
-  printf 'log: %s\n' "$log"
-  printf '\nIf this is the first Desktop launch, sign the Desktop window into the SAME account shown by:\n'
-  printf '  clp auth %s\n' "$profile"
+  /usr/bin/open -n "$app"
 }
 
 cmd_desktop() {
   local profile
   profile="$(resolve_profile "${1:-}")"
+  if [ "$profile" = "default" ]; then launch_desktop_default; else launch_desktop_named "$profile"; fi
+}
+
+cmd_desktop_login() {
+  local profile duti bid
+  profile="$(resolve_profile "${1:-}")"
 
   if [ "$profile" = "default" ]; then
+    printf 'default profile already owns the normal claude:// handler.\n'
     launch_desktop_default
-  else
-    launch_desktop_named "$profile"
+    return
   fi
+
+  duti="$(require_duti)"
+  ensure_handler_app "$profile"
+  bid="$(handler_bundle_id "$profile")"
+
+  # The browser has no concept of our profile. Temporarily make this profile's
+  # tiny router app the system claude:// handler. The router restores the stock
+  # handler as soon as it receives the OAuth callback.
+  "$duti" -s "$bid" claude all
+  printf '%s\n' "$profile" > "$PENDING_FILE"
+
+  printf 'Desktop OAuth profile: %s\n' "$profile"
+  printf 'claude:// handler:     %s\n' "$bid"
+  printf 'Expected CLI account:\n'
+  run_profile_cli "$profile" auth status --text || true
+  printf '\nOpening the isolated Desktop profile now. Start/sign in from THAT window.\n'
+  printf 'When Chrome asks to open the app, the callback will be routed back to "%s".\n' "$profile"
+  printf 'After the callback, the normal Claude handler is restored automatically.\n\n'
+
+  launch_desktop_named "$profile"
+}
+
+cmd_callback() {
+  local profile url
+  profile="$(resolve_profile "${1:-}")"
+  url="${2:-}"
+  [ -n "$url" ] || die "usage: clp callback <profile> <claude://URL>"
+  case "$url" in claude://*) ;; *) die "callback URL must begin with claude://" ;; esac
+  [ "$profile" != "default" ] || { /usr/bin/open "$url"; return; }
+  restore_stock_handler || true
+  launch_profile_desktop_process "$profile" "$url"
+  printf 'routed callback to Desktop profile: %s\n' "$profile"
+}
+
+cmd_internal_desktop_run() {
+  local profile
+  profile="$(resolve_profile "${1:-}")"
+  [ "$profile" != "default" ] || exit 0
+  launch_profile_desktop_process "$profile"
+}
+
+cmd_internal_desktop_callback() {
+  local profile url
+  profile="$(resolve_profile "${1:-}")"
+  url="${2:-}"
+  [ -n "$url" ] || exit 2
+  restore_stock_handler || true
+  launch_profile_desktop_process "$profile" "$url"
+}
+
+cmd_handler() {
+  case "${1:-}" in
+    reset)
+      local duti
+      duti="$(require_duti)"
+      "$duti" -s "$(stock_bundle_id)" claude all
+      rm -f "$PENDING_FILE"
+      printf 'restored claude:// handler to stock Claude (%s)\n' "$(stock_bundle_id)"
+      ;;
+    "")
+      local duti
+      duti="$(find_duti || true)"
+      if [ -z "$duti" ]; then
+        printf 'duti is not installed. Install with: brew install duti\n'
+      else
+        printf 'Current claude:// handler:\n'
+        "$duti" -x claude || true
+      fi
+      if [ -f "$PENDING_FILE" ]; then printf 'Pending Desktop auth profile: %s\n' "$(cat "$PENDING_FILE")"; fi
+      ;;
+    *) die "usage: clp handler [reset]" ;;
+  esac
 }
 
 cmd_both() {
-  local maybe_profile="${1:-}"
-  local profile
-
+  local maybe_profile="${1:-}" profile
   if [ -n "$maybe_profile" ] && [ "$maybe_profile" != "--" ] && profile_exists "$maybe_profile"; then
-    profile="$maybe_profile"
-    shift
+    profile="$maybe_profile"; shift
   else
     profile="$(active_profile)"
   fi
-  if [ "${1:-}" = "--" ]; then shift; fi
-
+  [ "${1:-}" != "--" ] || shift
   profile="$(resolve_profile "$profile")"
   cmd_desktop "$profile"
   sleep 1
@@ -320,88 +468,67 @@ cmd_path() {
   else
     printf 'CLI config:      %s\n' "$(profile_dir "$profile")"
     printf 'Desktop data:    %s\n' "$(desktop_dir "$profile")"
+    printf 'URL router app:  %s\n' "$(handler_app "$profile")"
     printf 'Credential slot: derived from the profile config directory\n'
   fi
 }
 
 cmd_purge() {
-  local name="${1:-}"
+  local name="${1:-}" answer
   [ -n "$name" ] || die "usage: clp purge <profile>"
   [ "$name" != "default" ] || die "refusing to purge the default Claude profile"
   profile_exists "$name" || die "profile '$name' does not exist"
 
   printf 'This permanently deletes local profile data for "%s". Type the profile name to confirm: ' "$name"
-  local answer
   IFS= read -r answer
   [ "$answer" = "$name" ] || die "confirmation did not match; nothing deleted"
 
-  rm -rf "$PROFILE_ROOT/$name" "$(desktop_dir "$name")"
-  if [ "$(active_profile)" = "$name" ]; then
-    printf 'default\n' > "$ACTIVE_FILE"
-  fi
+  rm -rf "$PROFILE_ROOT/$name" "$(desktop_dir "$name")" "$(handler_app "$name")"
+  if [ "$(active_profile)" = "$name" ]; then printf 'default\n' > "$ACTIVE_FILE"; fi
+  if [ -f "$PENDING_FILE" ] && [ "$(cat "$PENDING_FILE")" = "$name" ]; then restore_stock_handler || rm -f "$PENDING_FILE"; fi
   printf 'purged profile: %s\n' "$name"
   printf 'A profile-specific Claude Code credential may remain in macOS Keychain.\n'
 }
 
 cmd_doctor() {
-  local failed=0
+  local failed=0 had_conflict=0 v bin duti
   printf 'Claude Split doctor\n\n'
 
-  if [ "$(uname -s)" = "Darwin" ]; then
-    printf '[ok] macOS detected\n'
-  else
-    printf '[fail] this project supports macOS only\n'
-    failed=1
-  fi
+  if [ "$(uname -s)" = "Darwin" ]; then printf '[ok] macOS detected\n'; else printf '[fail] this project supports macOS only\n'; failed=1; fi
+  if [ -d "$APP_BUNDLE" ]; then printf '[ok] Claude Desktop: %s\n' "$APP_BUNDLE"; else printf '[warn] Claude Desktop not found at %s\n' "$APP_BUNDLE"; fi
 
-  if [ -d "$APP_BUNDLE" ]; then
-    printf '[ok] Claude Desktop: %s\n' "$APP_BUNDLE"
-  else
-    printf '[warn] Claude Desktop not found at %s\n' "$APP_BUNDLE"
-  fi
-
-  local bin
   bin="$(command -v claude 2>/dev/null || true)"
-  if [ -n "$bin" ]; then
-    printf '[ok] Claude Code: %s\n' "$bin"
-  else
-    printf '[warn] Claude Code CLI not found on PATH\n'
-  fi
+  if [ -n "$bin" ]; then printf '[ok] Claude Code: %s\n' "$bin"; else printf '[warn] Claude Code CLI not found on PATH\n'; fi
 
-  local had_conflict=0
-  local v
   for v in \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
     CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_FOUNDRY \
     GOOGLE_APPLICATION_CREDENTIALS \
     HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NODE_OPTIONS; do
-    if [ -n "${!v:-}" ]; then
-      printf '[warn] %s is set in the current shell\n' "$v"
-      had_conflict=1
-    fi
+    if [ -n "${!v:-}" ]; then printf '[warn] %s is set in the current shell\n' "$v"; had_conflict=1; fi
   done
-  if [ "$had_conflict" -eq 0 ]; then
-    printf '[ok] no known Claude/provider/proxy overrides detected\n'
+  if [ "$had_conflict" -eq 0 ]; then printf '[ok] no known Claude/provider/proxy overrides detected\n'; else printf '       clp strips these overrides when it launches Claude.\n'; fi
+
+  duti="$(find_duti || true)"
+  if [ -n "$duti" ]; then
+    printf '[ok] duti: %s (browser OAuth profile routing available)\n' "$duti"
   else
-    printf '       clp strips these overrides when it launches Claude.\n'
+    printf '[warn] duti not installed; named Desktop windows work, but browser OAuth callbacks cannot be profile-routed automatically\n'
+    printf '       install with: brew install duti\n'
   fi
 
-  if /usr/bin/open --help 2>&1 | grep -q -- '--env'; then
-    printf '[ok] macOS open supports per-instance --env injection\n'
-  else
-    printf '[warn] this macOS open command does not advertise --env; named Desktop profiles may not launch correctly\n'
-  fi
-
+  [ -x "$LSREGISTER" ] && printf '[ok] LaunchServices registration tool available\n' || printf '[warn] lsregister not found\n'
   printf '[ok] profile root: %s\n' "$PROFILE_ROOT"
   printf '[ok] desktop root: %s\n' "$DESKTOP_ROOT"
+  printf '[ok] handler root: %s\n' "$HANDLER_ROOT"
   printf '\nactive profile: %s\n' "$(active_profile)"
+  if [ -f "$PENDING_FILE" ]; then printf 'pending Desktop auth profile: %s\n' "$(cat "$PENDING_FILE")"; fi
   return "$failed"
 }
 
 main() {
   local command="${1:-help}"
   shift || true
-
   case "$command" in
     add) cmd_add "$@" ;;
     list|ls) cmd_list ;;
@@ -412,10 +539,15 @@ main() {
     logout) cmd_logout "$@" ;;
     code|cli) cmd_code "$@" ;;
     desktop|app) cmd_desktop "$@" ;;
+    desktop-login|app-login) cmd_desktop_login "$@" ;;
+    callback) cmd_callback "$@" ;;
+    handler) cmd_handler "$@" ;;
     both|open) cmd_both "$@" ;;
     doctor) cmd_doctor ;;
     path) cmd_path "$@" ;;
     purge) cmd_purge "$@" ;;
+    _desktop-run) cmd_internal_desktop_run "$@" ;;
+    _desktop-callback) cmd_internal_desktop_callback "$@" ;;
     help|-h|--help) usage ;;
     *) die "unknown command: $command (try: clp help)" ;;
   esac
